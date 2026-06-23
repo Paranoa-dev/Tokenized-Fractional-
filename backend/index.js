@@ -9,18 +9,20 @@ import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
-const DATA_FILE = join(__dirname, process.env.DATA_FILE || 'data.json');
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'dev-key-change-in-production';
 const CORS_ORIGINS = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map(s => s.trim())
   : ['http://localhost:5173', 'http://localhost:4173'];
 
+// Read at request time so tests can set env vars before the first request
+function getDataFile() {
+  return join(__dirname, process.env.DATA_FILE || 'data.json');
+}
+
 function loadData() {
-  if (!existsSync(DATA_FILE)) {
-    return {};
-  }
+  const file = getDataFile();
+  if (!existsSync(file)) return {};
   try {
-    return JSON.parse(readFileSync(DATA_FILE, 'utf-8'));
+    return JSON.parse(readFileSync(file, 'utf-8'));
   } catch {
     console.error('Corrupted data file, starting fresh');
     return {};
@@ -28,7 +30,7 @@ function loadData() {
 }
 
 function saveData(data) {
-  writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  writeFileSync(getDataFile(), JSON.stringify(data, null, 2), 'utf-8');
 }
 
 function validateContractId(id) {
@@ -46,7 +48,8 @@ function validateRwaBody(body) {
 
 function adminAuth(req, res, next) {
   const apiKey = req.headers['x-api-key'];
-  if (!apiKey || apiKey !== ADMIN_API_KEY) {
+  const expected = process.env.ADMIN_API_KEY || 'dev-key-change-in-production';
+  if (!apiKey || apiKey !== expected) {
     return res.status(401).json({ error: 'Unauthorized: invalid or missing API key' });
   }
   next();
@@ -153,6 +156,10 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`RWA Off-chain Metadata Backend running at http://localhost:${PORT}`);
-});
+export { app, validateContractId, validateRwaBody };
+
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => {
+    console.log(`RWA Off-chain Metadata Backend running at http://localhost:${PORT}`);
+  });
+}
