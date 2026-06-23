@@ -1,5 +1,4 @@
 #![no_std]
-#![allow(deprecated)]
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
 
 #[contract]
@@ -80,7 +79,7 @@ impl RwaMarketplace {
             .get(&DataKey::PaymentToken)
             .unwrap();
 
-        let client = token::Client::new(&env, &token_id);
+        let client = token::TokenClient::new(&env, &token_id);
         client.transfer(&buyer, &admin, &total_cost);
 
         env.storage()
@@ -162,7 +161,7 @@ impl RwaMarketplace {
             .get(&DataKey::PaymentToken)
             .unwrap();
 
-        let client = token::Client::new(&env, &token_id);
+        let client = token::TokenClient::new(&env, &token_id);
         client.transfer(&env.current_contract_address(), &to, &amount);
 
         env.events().publish(
