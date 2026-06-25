@@ -184,6 +184,25 @@ impl RwaMarketplace {
         EventBuyShares { buyer, shares, total_cost }.publish(&env);
     }
 
+    pub fn add_to_whitelist(env: Env, addr: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::Whitelisted(addr.clone()), &true);
+    }
+
+    pub fn remove_from_whitelist(env: Env, addr: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().persistent().remove(&DataKey::Whitelisted(addr.clone()));
+    }
+
+    pub fn is_whitelisted(env: Env, addr: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Whitelisted(addr))
+            .unwrap_or(false)
+    }
+
     /// Distribute `total_amount` of `token` pro-rata among all current holders
     /// based on their share count relative to total issued shares.
     ///
@@ -644,15 +663,45 @@ mod test {
     }
 
     #[test]
-    fn test_buy_shares() {
+    #[should_panic(expected = "Buyer is not whitelisted")]
+    fn test_buy_shares_requires_whitelist() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100000);
+        c.buy_shares(&te.buyer, &25);
+    }
+
+    #[test]
+    fn test_whitelist_admin_can_add_and_buy() {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100000);
 
+        assert!(!c.is_whitelisted(&te.buyer));
+        c.add_to_whitelist(&te.buyer);
+        assert!(c.is_whitelisted(&te.buyer));
+
         c.buy_shares(&te.buyer, &25);
         assert_eq!(c.get_shares(&te.buyer), 25);
         assert_eq!(c.get_available_shares(), 975);
+    }
+
+    #[test]
+    #[should_panic(expected = "Buyer is not whitelisted")]
+    fn test_remove_from_whitelist_blocks_buy() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100000);
+
+        c.add_to_whitelist(&te.buyer);
+        assert!(c.is_whitelisted(&te.buyer));
+        c.remove_from_whitelist(&te.buyer);
+        assert!(!c.is_whitelisted(&te.buyer));
+
+        c.buy_shares(&te.buyer, &25);
     }
 
     #[test]
@@ -661,6 +710,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100000);
+        c.add_to_whitelist(&te.buyer);
 
         c.buy_shares(&te.buyer, &10);
         c.buy_shares(&te.buyer, &20);
@@ -735,6 +785,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
 
         // Before any purchase, registry is empty
         assert_eq!(c.get_holders().len(), 0);
@@ -756,6 +807,8 @@ mod test {
         let buyer2 = Address::generate(&te.env);
         mint(&te, &te.buyer, 100_000);
         mint(&te, &buyer2, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.add_to_whitelist(&buyer2);
 
         c.buy_shares(&te.buyer, &10);
         c.buy_shares(&buyer2, &20);
@@ -769,6 +822,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
 
         c.buy_shares(&te.buyer, &500); // buyer owns 500 / 1000 shares = 50%
 
@@ -793,6 +847,8 @@ mod test {
         let buyer2 = Address::generate(&te.env);
         mint(&te, &te.buyer, 100_000);
         mint(&te, &buyer2, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.add_to_whitelist(&buyer2);
 
         // buyer: 250 shares (25%), buyer2: 750 shares (75%)
         c.buy_shares(&te.buyer, &250);
@@ -826,6 +882,8 @@ mod test {
         let buyer2 = Address::generate(&te.env);
         mint(&te, &te.buyer, 100_000);
         mint(&te, &buyer2, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.add_to_whitelist(&buyer2);
 
         c.buy_shares(&te.buyer, &10);
         c.buy_shares(&buyer2, &20);
@@ -883,6 +941,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
 
         c.set_price(&200);
         c.buy_shares(&te.buyer, &10);
@@ -926,6 +985,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
 
         c.buy_shares(&te.buyer, &100);
         assert_eq!(c.get_available_shares(), 900);
