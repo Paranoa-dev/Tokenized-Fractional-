@@ -633,7 +633,7 @@ impl RwaMarketplace {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger as _}, token, Env};
+    use soroban_sdk::{testutils::{Address as _, Ledger as _}, token, Env, IntoVal};
 
     struct TestEnv {
         env: Env,
