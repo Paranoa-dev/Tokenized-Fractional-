@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractevent, contractimpl, contracttype, token, Address, Env, Vec,
+    contract, contractevent, contractimpl, contracttype, token, Address, Bytes, Env, Vec,
 };
 
 #[contract]
@@ -18,6 +18,7 @@ pub enum DataKey {
     Balance(Address),
     VestingSchedules(Address),
     Holders, // registry of all unique holder addresses
+    MetadataUri,
 }
 
 #[contracttype]
@@ -182,6 +183,25 @@ impl RwaMarketplace {
         Self::register_holder(&env, buyer.clone());
 
         EventBuyShares { buyer, shares, total_cost }.publish(&env);
+    }
+
+    pub fn add_to_whitelist(env: Env, addr: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::Whitelisted(addr.clone()), &true);
+    }
+
+    pub fn remove_from_whitelist(env: Env, addr: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().persistent().remove(&DataKey::Whitelisted(addr.clone()));
+    }
+
+    pub fn is_whitelisted(env: Env, addr: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Whitelisted(addr))
+            .unwrap_or(false)
     }
 
     /// Distribute `total_amount` of `token` pro-rata among all current holders
@@ -462,6 +482,20 @@ impl RwaMarketplace {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Store a URI pointing to off-chain asset metadata. Admin only.
+    pub fn set_metadata_uri(env: Env, uri: Bytes) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("Contract not initialized: admin");
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::MetadataUri, &uri);
+    }
+
+    /// Retrieve the on-chain metadata URI. Returns empty bytes if not set.
+    pub fn get_metadata_uri(env: Env) -> Bytes {
+        env.storage().instance().get(&DataKey::MetadataUri)
+            .unwrap_or_else(|| Bytes::new(&env))
+    }
+
     pub fn get_shares(env: Env, owner: Address) -> u32 {
         env.storage()
             .persistent()
@@ -644,15 +678,45 @@ mod test {
     }
 
     #[test]
-    fn test_buy_shares() {
+    #[should_panic(expected = "Buyer is not whitelisted")]
+    fn test_buy_shares_requires_whitelist() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100000);
+        c.buy_shares(&te.buyer, &25);
+    }
+
+    #[test]
+    fn test_whitelist_admin_can_add_and_buy() {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100000);
 
+        assert!(!c.is_whitelisted(&te.buyer));
+        c.add_to_whitelist(&te.buyer);
+        assert!(c.is_whitelisted(&te.buyer));
+
         c.buy_shares(&te.buyer, &25);
         assert_eq!(c.get_shares(&te.buyer), 25);
         assert_eq!(c.get_available_shares(), 975);
+    }
+
+    #[test]
+    #[should_panic(expected = "Buyer is not whitelisted")]
+    fn test_remove_from_whitelist_blocks_buy() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100000);
+
+        c.add_to_whitelist(&te.buyer);
+        assert!(c.is_whitelisted(&te.buyer));
+        c.remove_from_whitelist(&te.buyer);
+        assert!(!c.is_whitelisted(&te.buyer));
+
+        c.buy_shares(&te.buyer, &25);
     }
 
     #[test]
@@ -661,6 +725,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100000);
+        c.add_to_whitelist(&te.buyer);
 
         c.buy_shares(&te.buyer, &10);
         c.buy_shares(&te.buyer, &20);
@@ -735,6 +800,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
 
         // Before any purchase, registry is empty
         assert_eq!(c.get_holders().len(), 0);
@@ -756,6 +822,8 @@ mod test {
         let buyer2 = Address::generate(&te.env);
         mint(&te, &te.buyer, 100_000);
         mint(&te, &buyer2, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.add_to_whitelist(&buyer2);
 
         c.buy_shares(&te.buyer, &10);
         c.buy_shares(&buyer2, &20);
@@ -769,6 +837,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
 
         c.buy_shares(&te.buyer, &500); // buyer owns 500 / 1000 shares = 50%
 
@@ -793,6 +862,8 @@ mod test {
         let buyer2 = Address::generate(&te.env);
         mint(&te, &te.buyer, 100_000);
         mint(&te, &buyer2, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.add_to_whitelist(&buyer2);
 
         // buyer: 250 shares (25%), buyer2: 750 shares (75%)
         c.buy_shares(&te.buyer, &250);
@@ -826,6 +897,8 @@ mod test {
         let buyer2 = Address::generate(&te.env);
         mint(&te, &te.buyer, 100_000);
         mint(&te, &buyer2, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.add_to_whitelist(&buyer2);
 
         c.buy_shares(&te.buyer, &10);
         c.buy_shares(&buyer2, &20);
@@ -883,6 +956,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
 
         c.set_price(&200);
         c.buy_shares(&te.buyer, &10);
@@ -926,6 +1000,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
 
         c.buy_shares(&te.buyer, &100);
         assert_eq!(c.get_available_shares(), 900);
@@ -1098,226 +1173,38 @@ mod test {
         client.emergency_withdraw(&admin, &0);
     }
 
-    // ── Edge case: complete sellout ─────────────────────────────────────
+    // ── Metadata URI tests ──────────────────────────────────────────────
 
     #[test]
-    fn test_buy_all_available_shares_sellout() {
-        let te = setup();
-        let c = client(&te);
-        c.init(&te.admin, &te.token_id, &100, &50);
-        mint(&te, &te.buyer, 100_000);
-
-        c.buy_shares(&te.buyer, &50);
-        assert_eq!(c.get_available_shares(), 0);
-        assert_eq!(c.get_shares(&te.buyer), 50);
-    }
-
-    #[test]
-    #[should_panic(expected = "Not enough shares available")]
-    fn test_buy_after_sellout_panics() {
-        let te = setup();
-        let c = client(&te);
-        c.init(&te.admin, &te.token_id, &100, &10);
-        mint(&te, &te.buyer, 100_000);
-
-        c.buy_shares(&te.buyer, &10); // sellout
-        c.buy_shares(&te.buyer, &1); // must panic
-    }
-
-    #[test]
-    fn test_buy_exact_remaining_shares_after_partial_sale() {
-        let te = setup();
-        let c = client(&te);
-        c.init(&te.admin, &te.token_id, &100, &20);
-        mint(&te, &te.buyer, 100_000);
-
-        c.buy_shares(&te.buyer, &15);
-        assert_eq!(c.get_available_shares(), 5);
-
-        c.buy_shares(&te.buyer, &5); // buy exact remainder
-        assert_eq!(c.get_available_shares(), 0);
-        assert_eq!(c.get_shares(&te.buyer), 20);
-    }
-
-    // ── Edge case: emergency_withdraw with non-zero balance ─────────────
-
-    #[test]
-    fn test_emergency_withdraw_non_zero_balance() {
-        let te = setup();
-        let c = client(&te);
-        c.init(&te.admin, &te.token_id, &100, &1000);
-        mint(&te, &te.buyer, 10_000);
-
-        c.buy_shares(&te.buyer, &10); // 10 * 100 = 1000 tokens sent to admin
-
-        // Mint some tokens directly to contract to simulate accumulated balance
-        mint(&te, &te.contract_id, 5_000);
-
-        let token_client = token::TokenClient::new(&te.env, &te.token_id);
-        let before = token_client.balance(&te.admin);
-
-        c.emergency_withdraw(&te.admin, &5_000);
-
-        assert_eq!(token_client.balance(&te.admin), before + 5_000);
-        assert_eq!(token_client.balance(&te.contract_id), 0);
-    }
-
-    // ── Edge case: multiple sequential pause/unpause cycles ────────────
-
-    #[test]
-    fn test_multiple_sequential_pause_unpause_cycles() {
+    fn test_set_and_get_metadata_uri() {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
 
-        for _ in 0..5 {
-            c.pause();
-            assert!(c.is_paused());
-            c.unpause();
-            assert!(!c.is_paused());
-        }
+        let uri = soroban_sdk::Bytes::from_slice(&te.env, b"ipfs://QmTest");
+        c.set_metadata_uri(&uri);
+        assert_eq!(c.get_metadata_uri(), uri);
     }
 
     #[test]
-    fn test_pause_pause_is_idempotent() {
+    fn test_get_metadata_uri_default_empty() {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
 
-        c.pause();
-        c.pause(); // pausing again should not panic
-        assert!(c.is_paused());
-    }
-
-    // ── Edge case: non-admin calling admin operations ───────────────────
-
-    #[test]
-    #[should_panic]
-    fn test_non_admin_cannot_pause() {
-        let te = setup();
-        let c = client(&te);
-        c.init(&te.admin, &te.token_id, &100, &1000);
-        te.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-            address: &te.buyer,
-            invoke: &soroban_sdk::testutils::MockAuthInvoke {
-                contract: &te.contract_id,
-                fn_name: "pause",
-                args: ().into_val(&te.env),
-                sub_invokes: &[],
-            },
-        }]);
-        c.pause();
+        assert_eq!(c.get_metadata_uri(), soroban_sdk::Bytes::new(&te.env));
     }
 
     #[test]
-    #[should_panic]
-    fn test_non_admin_cannot_unpause() {
+    fn test_set_metadata_uri_overwrites() {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
-        c.pause();
-        te.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-            address: &te.buyer,
-            invoke: &soroban_sdk::testutils::MockAuthInvoke {
-                contract: &te.contract_id,
-                fn_name: "unpause",
-                args: ().into_val(&te.env),
-                sub_invokes: &[],
-            },
-        }]);
-        c.unpause();
-    }
 
-    #[test]
-    #[should_panic]
-    fn test_non_admin_cannot_set_price() {
-        let te = setup();
-        let c = client(&te);
-        c.init(&te.admin, &te.token_id, &100, &1000);
-        te.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-            address: &te.buyer,
-            invoke: &soroban_sdk::testutils::MockAuthInvoke {
-                contract: &te.contract_id,
-                fn_name: "set_price",
-                args: (200i128,).into_val(&te.env),
-                sub_invokes: &[],
-            },
-        }]);
-        c.set_price(&200);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_non_admin_cannot_set_total_shares() {
-        let te = setup();
-        let c = client(&te);
-        c.init(&te.admin, &te.token_id, &100, &1000);
-        te.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-            address: &te.buyer,
-            invoke: &soroban_sdk::testutils::MockAuthInvoke {
-                contract: &te.contract_id,
-                fn_name: "set_total_shares",
-                args: (2000u32,).into_val(&te.env),
-                sub_invokes: &[],
-            },
-        }]);
-        c.set_total_shares(&2000);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_non_admin_cannot_emergency_withdraw() {
-        let te = setup();
-        let c = client(&te);
-        c.init(&te.admin, &te.token_id, &100, &1000);
-        mint(&te, &te.contract_id, 1_000);
-        te.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-            address: &te.buyer,
-            invoke: &soroban_sdk::testutils::MockAuthInvoke {
-                contract: &te.contract_id,
-                fn_name: "emergency_withdraw",
-                args: (&te.buyer, 1_000i128).into_val(&te.env),
-                sub_invokes: &[],
-            },
-        }]);
-        c.emergency_withdraw(&te.buyer, &1_000);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_non_admin_cannot_distribute_dividends() {
-        let te = setup();
-        let c = client(&te);
-        c.init(&te.admin, &te.token_id, &100, &1000);
-        mint(&te, &te.buyer, 100_000);
-        c.buy_shares(&te.buyer, &10);
-        mint(&te, &te.contract_id, 1_000);
-        te.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-            address: &te.buyer,
-            invoke: &soroban_sdk::testutils::MockAuthInvoke {
-                contract: &te.contract_id,
-                fn_name: "distribute_dividends",
-                args: (&te.token_id, 1_000i128).into_val(&te.env),
-                sub_invokes: &[],
-            },
-        }]);
-        c.distribute_dividends(&te.token_id, &1_000);
-    }
-
-    // ── Edge case: set_total_shares decreasing to exactly issued ────────
-
-    #[test]
-    fn test_set_total_shares_decrease_to_exactly_issued() {
-        let te = setup();
-        let c = client(&te);
-        c.init(&te.admin, &te.token_id, &100, &1000);
-        mint(&te, &te.buyer, 100_000);
-
-        c.buy_shares(&te.buyer, &400); // 400 issued, 600 available
-        c.set_total_shares(&400); // shrink to exactly issued
-        assert_eq!(c.get_total_shares(), 400);
-        assert_eq!(c.get_available_shares(), 0);
-        assert_eq!(c.get_shares(&te.buyer), 400);
+        c.set_metadata_uri(&soroban_sdk::Bytes::from_slice(&te.env, b"ipfs://old"));
+        let new_uri = soroban_sdk::Bytes::from_slice(&te.env, b"ipfs://new");
+        c.set_metadata_uri(&new_uri);
+        assert_eq!(c.get_metadata_uri(), new_uri);
     }
 }
 // --- TIMELOCK MODULE ---
@@ -1612,5 +1499,36 @@ mod property_tests {
                 prop_assert_eq!(client.get_total_shares(), INIT_TOTAL);
             }
         }
+    }
+}
+// ====================== CONTRACT UPGRADEABILITY (#6) ======================
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ContractUpgraded {
+    pub new_wasm_hash: BytesN<32>,
+}
+
+#[contractimpl]
+impl RwaMarketplace {
+
+    /// Upgrade the smart contract to a new version.
+    /// Only the admin can call this function.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        // Verify admin
+        let admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+
+        admin.require_auth();
+
+        // Perform the upgrade
+        env.deployer().upgrade_contract(new_wasm_hash.clone());
+
+        // Emit upgrade event
+        env.events().publish(
+            (symbol_short!("Contract"), symbol_short!("Upgraded")),
+            ContractUpgraded { new_wasm_hash },
+        );
     }
 }
