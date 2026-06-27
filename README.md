@@ -2,6 +2,68 @@
 
 A full-stack decentralized application (dApp) built on the **Stellar Network** using **Soroban Smart Contracts**. This marketplace allows administrators to tokenize real-world assets into fractional shares for users to purchase.
 
+## Architecture
+
+```mermaid
+graph TB
+    subgraph User["Browser"]
+        FRONTEND["React + Vite Frontend"]
+        FREIGHTER["Freighter Wallet Extension"]
+    end
+
+    subgraph OffChain["Off-Chain"]
+        BACKEND["Express.js Backend API<br/>(asset metadata)"]
+        DATA[(data.json)]
+    end
+
+    subgraph Stellar["Stellar Network"]
+        RPC["Soroban RPC Endpoint"]
+        CONTRACT["Soroban Smart Contract<br/>(Rust - RwaMarketplace)"]
+        TOKEN["Stellar Asset Contract<br/>(Payment Token)"]
+    end
+
+    FRONTEND -->|"1. Fetch asset metadata<br/>GET /api/rwa"| BACKEND
+    BACKEND -->|"Read/Write"| DATA
+
+    FRONTEND -->|"2. Simulate transaction<br/>get_shares / buy_shares"| RPC
+    RPC -->|"3. Invoke contract"| CONTRACT
+
+    FRONTEND -->|"4. Request signing<br/>(XDR)"| FREIGHTER
+    FREIGHTER -->|"5. Return signed XDR"| FRONTEND
+
+    FRONTEND -->|"6. Submit signed tx"| RPC
+    RPC -->|"7. Execute"| CONTRACT
+    CONTRACT -->|"8. Transfer tokens"| TOKEN
+    CONTRACT -->|"9. Update balances"| CONTRACT
+    RPC -->|"10. Return result"| FRONTEND
+
+    ADMIN["Admin"] -->|"Deploy / Init<br/>via Soroban CLI"| RPC
+    ADMIN -->|"Manage metadata<br/>via x-api-key"| BACKEND
+
+    style CONTRACT fill:#4a9eff,stroke:#2a6fd1,color:#fff
+    style FRONTEND fill:#6c5ce7,stroke:#5a4bd1,color:#fff
+    style FREIGHTER fill:#00b894,stroke:#009874,color:#fff
+    style BACKEND fill:#fdcb6e,stroke:#e0a800,color:#333
+    style RPC fill:#ff7675,stroke:#d63031,color:#fff
+    style TOKEN fill:#74b9ff,stroke:#0984e3,color:#fff
+    style ADMIN fill:#dfe6e9,stroke:#b2bec3,color:#333
+```
+
+### Data Flow — Buying Shares
+
+| Step | Description |
+|------|-------------|
+| 1 | Frontend fetches asset metadata from the Backend API (`GET /api/rwa`) |
+| 2 | User enters share amount and clicks "Buy Shares" |
+| 3 | Frontend builds a `buy_shares` transaction and simulates it via Soroban RPC |
+| 4 | Frontend sends the transaction XDR to Freighter Wallet for signing |
+| 5 | User approves in Freighter; signed XDR is returned |
+| 6 | Frontend submits the signed transaction to the Soroban RPC endpoint |
+| 7 | Soroban Smart Contract executes `buy_shares`: validates availability, transfers payment tokens from buyer to admin |
+| 8 | The Stellar Asset Contract (payment token) transfers the cost to the admin address |
+| 9 | Contract updates the buyer's share balance and available shares count |
+| 10 | Frontend refreshes the share balance via `get_shares` (simulate-only, no fee) |
+
 ## Project Structure
 
 ```
@@ -156,3 +218,5 @@ This will start an Nginx server on `http://localhost:80` that proxies requests:
 | `GET` | `/api/rwa/:contractId` | No | Get asset metadata |
 | `POST` | `/api/rwa` | `x-api-key` | Create/update asset |
 | `DELETE` | `/api/rwa/:contractId` | `x-api-key` | Delete asset |
+
+Interactive API documentation is available at [`/api-docs`](http://localhost:3001/api-docs) (Swagger UI) and [`/api-docs.json`](http://localhost:3001/api-docs.json) (raw OpenAPI spec) when the backend is running.

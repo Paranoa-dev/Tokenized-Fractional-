@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { signTransaction } from '@stellar/freighter-api';
-import { rpc, TransactionBuilder, Networks, Contract, nativeToScVal } from '@stellar/stellar-sdk';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { Networks, nativeToScVal } from '@stellar/stellar-sdk';
+import { useSorobanRead, useSorobanWrite } from './hooks/useSoroban';
 
 import Button from './components/Button/Button';
 import Card from './components/Card/Card';
@@ -11,17 +11,18 @@ import Skeleton from './components/Skeleton/Skeleton';
 import Spinner from './components/Spinner/Spinner';
 import AssetGrid from './components/AssetGrid/AssetGrid';
 import AdminPage from './components/AdminPage/AdminPage';
+import PortfolioPage from './components/PortfolioPage/PortfolioPage';
+import ToastContainer from './components/Toast/Toast';
 import styles from './App.module.css';
 
 import { useWalletStore } from './store/useWalletStore';
 import { useAssetStore } from './store/useAssetStore';
+import { useToastStore } from './store/useToastStore';
+import useTransactionStatus from './hooks/useTransactionStatus';
 
 const CONTRACT_ID = import.meta.env.VITE_CONTRACT_ID || 'C...';
-const RPC_URL = import.meta.env.VITE_RPC_URL || 'https://soroban-testnet.stellar.org:443';
 const NETWORK_PASSPHRASE = import.meta.env.VITE_NETWORK_PASSPHRASE || Networks.TESTNET;
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
-
-const server = new rpc.Server(RPC_URL);
 
 function App() {
   // ── Global store state ─────────────────────────────────────────────────────
@@ -39,12 +40,12 @@ function App() {
   } = useWalletStore();
 
   const {
-    assetMeta,
     assets,
+    assetMeta,
     isFetchingAssets,
     assetsError,
-    fetchMetadata,
     fetchAllAssets,
+    fetchMetadata,
     clearMeta,
     clearAssets,
   } = useAssetStore();
@@ -53,18 +54,23 @@ function App() {
   const [buyAmount, setBuyAmount] = useState(1);
 
   // Granular loading states
-  const [loadingBuy, setLoadingBuy] = useState(false);
-  const [loadingShares, setLoadingShares] = useState(false);
   const [loadingMeta, setLoadingMeta] = useState(false);
 
   const [error, setError] = useState(null);
   const [txError, setTxError] = useState(null);
   const [txResult, setTxResult] = useState(null);
+  const [lastTxHash, setLastTxHash] = useState(null);
+  const addToast = useToastStore((s) => s.addToast);
+  const removeToast = useToastStore((s) => s.removeToast);
+  const txStatus = useTransactionStatus(lastTxHash);
+  const pendingToastRef = useRef(null);
+  const notifiedRef = useRef({});
+
   const [theme, setTheme] = useState(() => {
     return localStorage.getItem('theme') || 'dark';
   });
 
-  // View state: 'marketplace' | 'admin'
+  // View state: 'marketplace' | 'portfolio' | 'admin'
   const [view, setView] = useState('marketplace');
 
   // ── Theme ──────────────────────────────────────────────────────────────────
@@ -77,6 +83,30 @@ function App() {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
   };
 
+  // ── Poll transaction status and update toasts ──────────────────────────────
+  useEffect(() => {
+    if (!lastTxHash || notifiedRef.current[lastTxHash]) return;
+
+    if (txStatus === 'confirmed') {
+      notifiedRef.current[lastTxHash] = true;
+      if (pendingToastRef.current) {
+        removeToast(pendingToastRef.current);
+        pendingToastRef.current = null;
+      }
+      addToast({ message: 'Transaction confirmed', type: 'success', txHash: lastTxHash });
+      setTxResult(null);
+      fetchShares();
+    } else if (txStatus === 'failed') {
+      notifiedRef.current[lastTxHash] = true;
+      if (pendingToastRef.current) {
+        removeToast(pendingToastRef.current);
+        pendingToastRef.current = null;
+      }
+      addToast({ message: 'Transaction failed', type: 'error', txHash: lastTxHash });
+      setTxError(null);
+    }
+  }, [lastTxHash, txStatus]);
+
   // ── On mount: re-validate Freighter session ────────────────────────────────
   // The persisted publicKey lets the UI render instantly; checkConnection()
   // then confirms the Freighter session is still live in the background.
@@ -84,10 +114,40 @@ function App() {
     checkConnection();
   }, [checkConnection]);
 
+  // Construct arguments dynamically
+  const fetchSharesArgs = useMemo(() => {
+    if (!publicKey) return [];
+    try {
+      return [nativeToScVal(publicKey, { type: 'address' })];
+    } catch (e) {
+      console.error('Failed to construct address ScVal:', e);
+      return [];
+    }
+  }, [publicKey]);
+
+  // Hook for get_shares
+  const {
+    loading: loadingShares,
+    refetch: fetchShares,
+  } = useSorobanRead('get_shares', fetchSharesArgs, {
+    skip: !publicKey || CONTRACT_ID.length < 50,
+    onSuccess: (result) => {
+      if (result && result.retval) {
+        setShares(Number(result.retval.u32()));
+      }
+    },
+    onError: (err) => {
+      console.error('Error fetching shares:', err);
+      setError('Failed to fetch share balance.');
+    },
+  });
+
+  const buySharesTx = useSorobanWrite('buy_shares');
+  const loadingBuy = buySharesTx.loading;
+
   // ── Fetch chain data whenever wallet connects ──────────────────────────────
   useEffect(() => {
     if (publicKey) {
-      fetchShares();
       fetchMetadata(CONTRACT_ID, API_URL);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -114,93 +174,40 @@ function App() {
     setTxError(null);
   };
 
-  const fetchShares = async () => {
-    if (!publicKey || CONTRACT_ID.length < 50) return;
-    setLoadingShares(true);
-    try {
-      setWalletError(null);
-      const contract = new Contract(CONTRACT_ID);
-      const scValAddress = nativeToScVal(publicKey, { type: 'address' });
-
-      const account = await server.getAccount(publicKey);
-      const tx = new TransactionBuilder(account, {
-        fee: '100',
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(contract.call('get_shares', scValAddress))
-        .setTimeout(30)
-        .build();
-
-      const simulation = await server.simulateTransaction(tx);
-      if (simulation.result) {
-        const parsedShares = Number(simulation.result.retval.u32());
-        setShares(parsedShares);
-      }
-    } catch (err) {
-      console.error('Error fetching shares:', err);
-      setError('Failed to fetch share balance.');
-    } finally {
-      setLoadingShares(false);
-    }
-  };
-
   // ── Transactions ───────────────────────────────────────────────────────────
   const handleBuyShares = async () => {
     if (!publicKey) return;
     if (buyAmount < 1) {
-      setTxError('Must buy at least 1 share');
+      addToast({ message: 'Must buy at least 1 share', type: 'error' });
       return;
     }
 
-    setLoadingBuy(true);
     setError(null);
     setTxResult(null);
+    setLastTxHash(null);
 
     try {
-      const account = await server.getAccount(publicKey);
-      const contract = new Contract(CONTRACT_ID);
-
       const scValBuyer = nativeToScVal(publicKey, { type: 'address' });
       const scValShares = nativeToScVal(buyAmount, { type: 'u32' });
 
-      let tx = new TransactionBuilder(account, {
-        fee: '10000',
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(contract.call('buy_shares', scValBuyer, scValShares))
-        .setTimeout(30)
-        .build();
+      const submitRes = await buySharesTx.execute([scValBuyer, scValShares]);
 
-      const simulation = await server.simulateTransaction(tx);
-      if (simulation.error) {
-        throw new Error(simulation.error);
-      }
-
-      tx = rpc.assembleTransaction(tx, simulation).build();
-      const { signedTxXdr, error: signError } = await signTransaction(tx.toXDR(), {
-        networkPassphrase: NETWORK_PASSPHRASE,
+      const hash = submitRes.hash;
+      setLastTxHash(hash);
+      pendingToastRef.current = addToast({
+        message: 'Transaction submitted, waiting for confirmation…',
+        type: 'pending',
+        txHash: hash,
       });
-      if (signError || !signedTxXdr) {
-        throw new Error(signError?.message || 'Freighter transaction signing failed');
-      }
-
-      const submitRes = await server.sendTransaction(
-        TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE)
-      );
-
-      setTxResult(`Transaction submitted! Hash: ${submitRes.hash}`);
-      await fetchShares();
     } catch (err) {
       console.error('Error buying shares:', err);
+      let msg = 'Transaction failed. Check your token balance and try again.';
       if (err.message?.includes('paused')) {
-        setTxError('Marketplace is currently paused. Try again later.');
+        msg = 'Marketplace is currently paused. Try again later.';
       } else if (err.message?.includes('Not enough shares')) {
-        setTxError('Not enough shares available.');
-      } else {
-        setTxError('Transaction failed. Check your token balance and try again.');
+        msg = 'Not enough shares available.';
       }
-    } finally {
-      setLoadingBuy(false);
+      addToast({ message: msg, type: 'error' });
     }
   };
 
@@ -257,6 +264,12 @@ function App() {
           Marketplace
         </button>
         <button
+          className={`${styles.tab} ${view === 'portfolio' ? styles.tabActive : ''}`}
+          onClick={() => setView('portfolio')}
+        >
+          Portfolio
+        </button>
+        <button
           className={`${styles.tab} ${view === 'admin' ? styles.tabActive : ''}`}
           onClick={() => setView('admin')}
         >
@@ -264,7 +277,11 @@ function App() {
         </button>
       </nav>
 
-      {view === 'admin' ? (
+      <ToastContainer />
+
+      {view === 'portfolio' ? (
+        <PortfolioPage />
+      ) : view === 'admin' ? (
         <AdminPage
           publicKey={publicKey}
           onDisconnect={() => setView('marketplace')}
@@ -275,20 +292,6 @@ function App() {
       {walletError && (
         <Alert variant="error">
           {walletError}
-        </Alert>
-      )}
-
-      {/* Transaction errors */}
-      {txError && (
-        <Alert variant="error">
-          {txError}
-        </Alert>
-      )}
-
-      {/* Transaction success */}
-      {txResult && (
-        <Alert variant="success">
-          {txResult}
         </Alert>
       )}
 
