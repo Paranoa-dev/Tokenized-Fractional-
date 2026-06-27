@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import Button from '../Button/Button';
+import Input from '../Input/Input';
 import Alert from '../Alert/Alert';
 import styles from './EmergencyWithdraw.module.css';
 
@@ -11,13 +12,19 @@ export default function EmergencyWithdraw({ publicKey }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
+  const [amount, setAmount] = useState('');
 
   const handleWithdraw = async () => {
     if (!publicKey || CONTRACT_ID.length < 50) {
       setError('Wallet must be connected and contract must be configured');
       return;
     }
-    if (!confirm('Emergency withdraw will transfer all tokens from the contract back to admin. Continue?')) return;
+    const parsedAmount = BigInt(amount);
+    if (!amount || parsedAmount <= 0) {
+      setError('Enter a valid positive amount to withdraw');
+      return;
+    }
+    if (!confirm(`Emergency withdraw ${amount} tokens from the contract to ${publicKey.slice(0, 8)}…? Continue?`)) return;
 
     setLoading(true);
     setError('');
@@ -25,7 +32,7 @@ export default function EmergencyWithdraw({ publicKey }) {
 
     try {
       const { signTransaction } = await import('@stellar/freighter-api');
-      const { rpc, TransactionBuilder, Contract } = await import('@stellar/stellar-sdk');
+      const { rpc, TransactionBuilder, Contract, nativeToScVal } = await import('@stellar/stellar-sdk');
       const server = new rpc.Server(RPC_URL);
       const contract = new Contract(CONTRACT_ID);
 
@@ -34,7 +41,13 @@ export default function EmergencyWithdraw({ publicKey }) {
         fee: '10000',
         networkPassphrase: NETWORK_PASSPHRASE,
       })
-        .addOperation(contract.call('emergency_withdraw'))
+        .addOperation(
+          contract.call(
+            'emergency_withdraw',
+            nativeToScVal(publicKey, { type: 'address' }),
+            nativeToScVal(parsedAmount, { type: 'i128' }),
+          )
+        )
         .setTimeout(30)
         .build();
 
@@ -69,6 +82,22 @@ export default function EmergencyWithdraw({ publicKey }) {
 
       {error && <Alert variant="error">{error}</Alert>}
       {success && <Alert variant="success">{success}</Alert>}
+
+      <div className={styles.inputRow}>
+        <Input
+          id="ew-amount"
+          type="number"
+          value={amount}
+          onChange={(e) => {
+            setAmount(e.target.value);
+            setError('');
+            setSuccess('');
+          }}
+          min="1"
+          disabled={loading}
+          placeholder="Amount to withdraw"
+        />
+      </div>
 
       <Button
         variant="danger"

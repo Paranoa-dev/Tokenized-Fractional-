@@ -11,6 +11,7 @@ import Skeleton from './components/Skeleton/Skeleton';
 import Spinner from './components/Spinner/Spinner';
 import AssetGrid from './components/AssetGrid/AssetGrid';
 import AdminPage from './components/AdminPage/AdminPage';
+import PortfolioPage from './components/PortfolioPage/PortfolioPage';
 import styles from './App.module.css';
 
 import { useWalletStore } from './store/useWalletStore';
@@ -39,11 +40,9 @@ function App() {
   } = useWalletStore();
 
   const {
-    assetMeta,
     assets,
     isFetchingAssets,
     assetsError,
-    fetchMetadata,
     fetchAllAssets,
     clearMeta,
     clearAssets,
@@ -65,7 +64,7 @@ function App() {
     return localStorage.getItem('theme') || 'dark';
   });
 
-  // View state: 'marketplace' | 'admin'
+  // View state: 'marketplace' | 'portfolio' | 'admin'
   const [view, setView] = useState('marketplace');
 
   // ── Theme ──────────────────────────────────────────────────────────────────
@@ -274,6 +273,12 @@ function App() {
           Marketplace
         </button>
         <button
+          className={`${styles.tab} ${view === 'portfolio' ? styles.tabActive : ''}`}
+          onClick={() => setView('portfolio')}
+        >
+          Portfolio
+        </button>
+        <button
           className={`${styles.tab} ${view === 'admin' ? styles.tabActive : ''}`}
           onClick={() => setView('admin')}
         >
@@ -281,7 +286,9 @@ function App() {
         </button>
       </nav>
 
-      {view === 'admin' ? (
+      {view === 'portfolio' ? (
+        <PortfolioPage />
+      ) : view === 'admin' ? (
         <AdminPage
           publicKey={publicKey}
           onDisconnect={() => setView('marketplace')}
