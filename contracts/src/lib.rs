@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractevent, contractimpl, contracttype, token, Address, Bytes, Env, Vec,
+    contract, contractevent, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Vec,
 };
 
 #[contract]
@@ -17,8 +17,13 @@ pub enum DataKey {
     Paused,
     Balance(Address),
     VestingSchedules(Address),
-    Holders, // registry of all unique holder addresses
+    Holders,
     MetadataUri,
+    DividendSchedule,
+    LastDistribution,
+    Whitelisted(Address),
+    SellOrder(u64),
+    NextOrderId,
 }
 
 #[contracttype]
@@ -37,6 +42,13 @@ pub struct SellOrder {
     pub seller: Address,
     pub amount: u32,
     pub price_per_share: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct DividendSchedule {
+    pub amount_per_share: i128,
+    pub interval: u64,
 }
 
 #[contractevent(data_format = "vec")]
@@ -86,6 +98,18 @@ pub struct EventUnpause {}
 pub struct EventEmergencyWithdraw {
     to: Address,
     amount: i128,
+}
+
+#[contractevent(data_format = "vec")]
+pub struct EventSetDividendSchedule {
+    amount_per_share: i128,
+    interval: u64,
+}
+
+#[contractevent(data_format = "vec")]
+pub struct EventScheduledDividend {
+    total_amount: i128,
+    holder_count: u32,
 }
 
 // ← NEW: dividend distribution event
@@ -178,6 +202,10 @@ impl RwaMarketplace {
             .get(&DataKey::AvailableShares)
             .expect("Contract not initialized: available shares");
 
+        if !Self::is_whitelisted(env.clone(), buyer.clone()) {
+            panic!("Buyer is not whitelisted");
+        }
+
         if shares > available {
             panic!("Not enough shares available for purchase");
         }
@@ -188,7 +216,7 @@ impl RwaMarketplace {
 
         let price: i128 = env.storage().instance().get(&DataKey::PricePerShare)
             .expect("Contract not initialized: price");
-        let total_cost = price * (shares as i128);
+        let total_cost = checked_mul_i128(price, shares as i128);
 
         let admin: Address = env.storage().instance().get(&DataKey::Admin)
             .expect("Contract not initialized: admin");
@@ -534,6 +562,106 @@ impl RwaMarketplace {
             .unwrap_or_else(|| Bytes::new(&env))
     }
 
+    pub fn set_dividend_schedule(env: Env, amount_per_share: i128, interval: u64) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("Contract not initialized: admin");
+        admin.require_auth();
+
+        if amount_per_share <= 0 {
+            panic!("Amount per share must be positive");
+        }
+        if interval == 0 {
+            panic!("Interval must be positive");
+        }
+
+        let schedule = DividendSchedule { amount_per_share, interval };
+        env.storage().instance().set(&DataKey::DividendSchedule, &schedule);
+
+        EventSetDividendSchedule { amount_per_share, interval }.publish(&env);
+    }
+
+    pub fn get_dividend_schedule(env: Env) -> Option<DividendSchedule> {
+        env.storage().instance().get(&DataKey::DividendSchedule)
+    }
+
+    /// Process a scheduled dividend distribution. Callable by anyone.
+    /// Checks that the interval has elapsed since last_distribution,
+    /// then distributes amount_per_share * total_shares pro-rata to holders.
+    pub fn process_scheduled_dividend(env: Env) {
+        let last_distribution: u64 = env.storage()
+            .instance()
+            .get(&DataKey::LastDistribution)
+            .unwrap_or(0);
+
+        let now = env.ledger().timestamp();
+        if now < last_distribution {
+            panic!("Ledger timestamp is in the past relative to last distribution");
+        }
+
+        let schedule: DividendSchedule = env.storage().instance()
+            .get(&DataKey::DividendSchedule)
+            .expect("Dividend schedule not configured");
+
+        if now < last_distribution.saturating_add(schedule.interval) {
+            panic!("Dividend interval has not elapsed yet");
+        }
+
+        let total_shares: u32 = env.storage().instance()
+            .get(&DataKey::TotalShares)
+            .expect("Contract not initialized: total shares");
+
+        if total_shares == 0 {
+            panic!("No shares have been issued");
+        }
+
+        let total_amount = checked_mul_i128(schedule.amount_per_share, total_shares as i128);
+        if total_amount <= 0 {
+            panic!("Dividend total amount must be positive");
+        }
+
+        let holders: Vec<Address> = env.storage().instance()
+            .get(&DataKey::Holders)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if holders.is_empty() {
+            panic!("No holders registered");
+        }
+
+        let token_id: Address = env.storage().instance()
+            .get(&DataKey::PaymentToken)
+            .expect("Contract not initialized: payment token");
+
+        let client = token::TokenClient::new(&env, &token_id);
+        let contract_addr = env.current_contract_address();
+
+        let mut active_holders: Vec<Address> = Vec::new(&env);
+
+        for holder in holders.iter() {
+            let holder_shares: u32 = env.storage().persistent()
+                .get(&DataKey::Balance(holder.clone()))
+                .unwrap_or(0);
+
+            if holder_shares == 0 {
+                continue;
+            }
+
+            active_holders.push_back(holder.clone());
+
+            let holder_amount = checked_mul_i128(total_amount, holder_shares as i128) / (total_shares as i128);
+
+            if holder_amount > 0 {
+                client.transfer(&contract_addr, &holder, &holder_amount);
+            }
+        }
+
+        env.storage().instance().set(&DataKey::Holders, &active_holders);
+        env.storage().instance().set(&DataKey::LastDistribution, &now);
+
+        let holder_count = active_holders.len();
+
+        EventScheduledDividend { total_amount, holder_count }.publish(&env);
+    }
+
     pub fn get_shares(env: Env, owner: Address) -> u32 {
         env.storage()
             .persistent()
@@ -773,7 +901,7 @@ impl RwaMarketplace {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger as _}, token, Env, IntoVal};
+    use soroban_sdk::{testutils::{Address as _, Ledger as _}, token, Env};
 
     struct TestEnv {
         env: Env,
@@ -935,6 +1063,7 @@ mod test {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &10);
+        c.add_to_whitelist(&te.buyer);
         mint(&te, &te.buyer, 100000);
         c.buy_shares(&te.buyer, &20);
     }
@@ -945,6 +1074,7 @@ mod test {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
+        c.add_to_whitelist(&te.buyer);
         c.buy_shares(&te.buyer, &0);
     }
 
@@ -1202,6 +1332,7 @@ mod test {
         let c = client(&te);
         // Use very high price that will overflow when multiplied by shares
         c.init(&te.admin, &te.token_id, &i128::MAX, &1000);
+        c.add_to_whitelist(&te.buyer);
         mint(&te, &te.buyer, i128::MAX);
         
         // This should panic because price * shares overflows
@@ -1214,6 +1345,7 @@ mod test {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
+        c.add_to_whitelist(&te.buyer);
         mint(&te, &te.buyer, 100_000);
         
         // Buy more shares than available (caught by logic check, not arithmetic)
@@ -1226,6 +1358,7 @@ mod test {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &1, &u32::MAX);
+        c.add_to_whitelist(&te.buyer);
         mint(&te, &te.buyer, i128::MAX);
         
         // Manually set high balance to test the checked_add_u32 in balance calculation
@@ -1245,6 +1378,7 @@ mod test {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
+        c.add_to_whitelist(&te.buyer);
         mint(&te, &te.buyer, 100_000);
         
         c.buy_shares(&te.buyer, &500);
@@ -1263,6 +1397,7 @@ mod test {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
+        c.add_to_whitelist(&te.buyer);
         mint(&te, &te.buyer, 100_000);
         
         // Buy some shares to create issued_shares
@@ -1369,6 +1504,195 @@ mod test {
         let new_uri = soroban_sdk::Bytes::from_slice(&te.env, b"ipfs://new");
         c.set_metadata_uri(&new_uri);
         assert_eq!(c.get_metadata_uri(), new_uri);
+    }
+
+    // ── Dividend schedule tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_set_dividend_schedule() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        c.set_dividend_schedule(&10_i128, &86400_u64);
+        let schedule = c.get_dividend_schedule().unwrap();
+        assert_eq!(schedule.amount_per_share, 10);
+        assert_eq!(schedule.interval, 86400);
+    }
+
+    #[test]
+    fn test_get_dividend_schedule_default_none() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        assert!(c.get_dividend_schedule().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "Amount per share must be positive")]
+    fn test_set_dividend_schedule_zero_amount() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        c.set_dividend_schedule(&0, &86400);
+    }
+
+    #[test]
+    #[should_panic(expected = "Amount per share must be positive")]
+    fn test_set_dividend_schedule_negative_amount() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        c.set_dividend_schedule(&-1, &86400);
+    }
+
+    #[test]
+    #[should_panic(expected = "Interval must be positive")]
+    fn test_set_dividend_schedule_zero_interval() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        c.set_dividend_schedule(&10, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Dividend schedule not configured")]
+    fn test_process_scheduled_dividend_no_schedule() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        c.process_scheduled_dividend();
+    }
+
+    #[test]
+    #[should_panic(expected = "Dividend interval has not elapsed yet")]
+    fn test_process_scheduled_dividend_interval_not_elapsed() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        c.set_dividend_schedule(&10, &86400);
+        // Call immediately — interval (86400s = 1 day) has not elapsed
+        c.process_scheduled_dividend();
+    }
+
+    #[test]
+    fn test_process_scheduled_dividend_distributes() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        let buyer2 = Address::generate(&te.env);
+        mint(&te, &te.buyer, 100_000);
+        mint(&te, &buyer2, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.add_to_whitelist(&buyer2);
+
+        c.buy_shares(&te.buyer, &300);
+        c.buy_shares(&buyer2, &700);
+        assert_eq!(c.get_available_shares(), 0);
+
+        // Set schedule: 10 tokens per share, daily
+        c.set_dividend_schedule(&10, &86400);
+
+        // total_amount = 10 * 1000 = 10_000
+        let total_amount: i128 = 10 * 1000;
+        mint(&te, &te.contract_id, total_amount);
+
+        // Fast-forward past the interval
+        te.env.ledger().set_timestamp(te.env.ledger().timestamp() + 86401);
+
+        c.process_scheduled_dividend();
+
+        let token_client = token::TokenClient::new(&te.env, &te.token_id);
+        // buyer: 100_000 initial - 300*100 cost + (10_000 * 300 / 1000) = 100_000 - 30_000 + 3_000
+        assert_eq!(token_client.balance(&te.buyer), 100_000 - 30_000 + 3_000);
+        // buyer2: 100_000 - 700*100 + (10_000 * 700 / 1000) = 100_000 - 70_000 + 7_000
+        assert_eq!(token_client.balance(&buyer2), 100_000 - 70_000 + 7_000);
+    }
+
+    #[test]
+    fn test_process_scheduled_dividend_updates_last_distribution() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.buy_shares(&te.buyer, &500);
+
+        c.set_dividend_schedule(&1, &100);
+        mint(&te, &te.contract_id, 500);
+
+        te.env.ledger().set_timestamp(te.env.ledger().timestamp() + 101);
+        c.process_scheduled_dividend();
+    }
+
+    #[test]
+    #[should_panic(expected = "Dividend interval has not elapsed yet")]
+    fn test_process_scheduled_dividend_second_call_too_soon() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.buy_shares(&te.buyer, &500);
+
+        c.set_dividend_schedule(&1, &100);
+        mint(&te, &te.contract_id, 1000);
+
+        te.env.ledger().set_timestamp(te.env.ledger().timestamp() + 101);
+        c.process_scheduled_dividend();
+
+        // Second call before next interval should fail
+        c.process_scheduled_dividend();
+    }
+
+    #[test]
+    fn test_process_scheduled_dividend_after_multiple_intervals() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+        c.buy_shares(&te.buyer, &500);
+
+        c.set_dividend_schedule(&5, &3600); // every hour
+        mint(&te, &te.contract_id, 2500);
+
+        let start = te.env.ledger().timestamp();
+
+        // First distribution after 1 hour
+        te.env.ledger().set_timestamp(start + 3601);
+        c.process_scheduled_dividend();
+
+        // Second distribution after another hour
+        mint(&te, &te.contract_id, 2500);
+        te.env.ledger().set_timestamp(start + 7201);
+        c.process_scheduled_dividend();
+
+        let token_client = token::TokenClient::new(&te.env, &te.token_id);
+        // buyer: 100_000 - 500*100 + 2500 + 2500 = 100_000 - 50_000 + 5_000
+        assert_eq!(token_client.balance(&te.buyer), 100_000 - 50_000 + 5_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "No holders registered")]
+    fn test_process_scheduled_dividend_no_holders() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        c.set_dividend_schedule(&10, &1);
+        te.env.ledger().set_timestamp(te.env.ledger().timestamp() + 2);
+        c.process_scheduled_dividend();
     }
 }
 // --- TIMELOCK MODULE ---
@@ -1533,6 +1857,10 @@ mod property_tests {
 
             client.init(&admin, &token_id, &INIT_PRICE, &INIT_TOTAL);
 
+            for b in buyers.iter() {
+                client.add_to_whitelist(b);
+            }
+
             let mut balances = [0u32; NUM_BUYERS];
             let mut available = INIT_TOTAL;
             let mut total = INIT_TOTAL;
@@ -1637,6 +1965,7 @@ mod property_tests {
             let buyer = Address::generate(&env);
             token::StellarAssetClient::new(&env, &token_id).mint(&buyer, &1_000_000_000);
             client.init(&admin, &token_id, &INIT_PRICE, &INIT_TOTAL);
+            client.add_to_whitelist(&buyer);
 
             let mut total_bought = 0u32;
 
@@ -1667,9 +1996,8 @@ mod property_tests {
 }
 // ====================== CONTRACT UPGRADEABILITY (#6) ======================
 
-#[contracttype]
-#[derive(Clone)]
-pub struct ContractUpgraded {
+#[contractevent(data_format = "vec")]
+pub struct EventContractUpgraded {
     pub new_wasm_hash: BytesN<32>,
 }
 
@@ -1679,20 +2007,14 @@ impl RwaMarketplace {
     /// Upgrade the smart contract to a new version.
     /// Only the admin can call this function.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        // Verify admin
         let admin: Address = env.storage().instance()
             .get(&DataKey::Admin)
             .expect("Contract not initialized");
 
         admin.require_auth();
 
-        // Perform the upgrade
-        env.deployer().upgrade_contract(new_wasm_hash.clone());
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
 
-        // Emit upgrade event
-        env.events().publish(
-            (symbol_short!("Contract"), symbol_short!("Upgraded")),
-            ContractUpgraded { new_wasm_hash },
-        );
+        EventContractUpgraded { new_wasm_hash }.publish(&env);
     }
 }
