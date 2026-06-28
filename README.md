@@ -218,7 +218,8 @@ This will start an Nginx server on `http://localhost:80` that proxies requests:
 | Function | Description | Auth |
 |---|---|---|
 | `init` | Initialize marketplace | Admin |
-| `buy_shares` | Purchase fractional shares | Buyer |
+| `buy_shares` | Purchase fractional shares (mints NFT certificate per share if configured) | Buyer |
+| `set_nft_contract` | Configure NFT contract for certificate minting | Admin |
 | `get_shares` | Query user balance | None |
 | `get_available_shares` | Query remaining shares | None |
 | `get_total_shares` | Query total shares | None |
@@ -227,6 +228,12 @@ This will start an Nginx server on `http://localhost:80` that proxies requests:
 | `pause` | Pause marketplace | Admin |
 | `unpause` | Unpause marketplace | Admin |
 | `emergency_withdraw` | Withdraw tokens from contract | Admin |
+
+### NFT Share Certificates
+
+When users buy shares, they receive **SEP-41 compliant NFT certificates** representing their ownership. These NFTs can be viewed in wallets, transferred peer-to-peer, and traded on secondary marketplaces.
+
+👉 **[See NFT Certificates Documentation](docs/NFT_CERTIFICATES.md)** for setup, deployment, and integration details.
 
 ## Backend API
 

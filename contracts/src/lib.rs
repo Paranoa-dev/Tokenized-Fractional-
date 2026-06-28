@@ -1,7 +1,14 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractevent, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Vec,
+    contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Bytes,
+    BytesN, Env, Vec,
 };
+
+/// Minimal interface for calling the deployed ShareCertificate NFT contract.
+#[contractclient(name = "NftContractClient")]
+pub trait NftContractInterface {
+    fn mint_certificate(env: Env, to: Address) -> u32;
+}
 
 #[contract]
 pub struct RwaMarketplace;
@@ -31,6 +38,8 @@ pub enum DataKey {
     BuybackBudget,
     LastBuyback,
     AcceptedTokens,
+    /// Optional NFT contract address for minting share certificates on buy
+    NftContract,
 }
 
 #[contracttype]
@@ -333,7 +342,33 @@ impl RwaMarketplace {
         // Register as new holder only on first purchase or if not registered yet
         Self::register_holder(&env, buyer.clone());
 
+        // Mint one share-certificate NFT per share purchased (if NFT contract is configured).
+        if let Some(nft_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::NftContract)
+        {
+            let nft = NftContractClient::new(&env, &nft_addr);
+            for _ in 0..shares {
+                nft.mint_certificate(&buyer);
+            }
+        }
+
         EventBuyShares { buyer, shares, total_cost }.publish(&env);
+    }
+
+    /// Set (or update) the share-certificate NFT contract address. Admin only.
+    /// Once set, every `buy_shares` call mints one NFT per share to the buyer.
+    pub fn set_nft_contract(env: Env, nft_contract: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("Contract not initialized: admin");
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::NftContract, &nft_contract);
+    }
+
+    /// Return the configured NFT contract address, or None if not set.
+    pub fn get_nft_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::NftContract)
     }
 
     pub fn add_to_whitelist(env: Env, addr: Address) {
@@ -2605,6 +2640,94 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         c.process_auto_buyback(&te.buyer, &10);
+    }
+
+    // ── NFT minting tests ───────────────────────────────────────────────
+
+    use share_certificate_nft::ShareCertificate;
+
+    fn setup_nft(te: &TestEnv) -> Address {
+        let nft_id = te.env.register(ShareCertificate, ());
+        let nft_client = share_certificate_nft::ShareCertificateClient::new(&te.env, &nft_id);
+        nft_client.init(
+            &te.contract_id, // minter = marketplace contract
+            &soroban_sdk::String::from_str(&te.env, "ipfs://rwa/"),
+            &soroban_sdk::String::from_str(&te.env, "RWA Share Certificate"),
+            &soroban_sdk::String::from_str(&te.env, "RWAC"),
+        );
+        nft_id
+    }
+
+    #[test]
+    fn test_set_and_get_nft_contract() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        let nft_id = setup_nft(&te);
+        c.set_nft_contract(&nft_id);
+        assert_eq!(c.get_nft_contract(), Some(nft_id));
+    }
+
+    #[test]
+    fn test_get_nft_contract_default_none() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        assert_eq!(c.get_nft_contract(), None);
+    }
+
+    #[test]
+    fn test_buy_shares_mints_nfts() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+
+        let nft_id = setup_nft(&te);
+        c.set_nft_contract(&nft_id);
+
+        c.buy_shares(&te.buyer, &3, &te.token_id);
+
+        // 3 shares purchased → 3 NFTs minted
+        use stellar_tokens::non_fungible::Base;
+        te.env.as_contract(&nft_id, || {
+            assert_eq!(Base::balance(&te.env, &te.buyer), 3);
+        });
+    }
+
+    #[test]
+    fn test_buy_shares_without_nft_contract_still_works() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+
+        // No NFT contract configured — buy_shares should succeed normally
+        c.buy_shares(&te.buyer, &5, &te.token_id);
+        assert_eq!(c.get_shares(&te.buyer), 5);
+    }
+
+    #[test]
+    fn test_nft_owner_is_buyer() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
+
+        let nft_id = setup_nft(&te);
+        c.set_nft_contract(&nft_id);
+
+        c.buy_shares(&te.buyer, &1, &te.token_id);
+
+        use stellar_tokens::non_fungible::Base;
+        te.env.as_contract(&nft_id, || {
+            assert_eq!(Base::owner_of(&te.env, 0), te.buyer);
+        });
     }
 }
 // --- TIMELOCK MODULE ---
