@@ -98,6 +98,16 @@ function adminAuth(req, res, next) {
   next();
 }
 
+const ASSET_STATUS = {
+  PENDING: 'pending',
+  APPROVED: 'approved',
+  REJECTED: 'rejected',
+};
+
+function isApproved(asset) {
+  return !asset.status || asset.status === ASSET_STATUS.APPROVED;
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 const app = express();
 
@@ -137,7 +147,7 @@ app.use('/api/', apiLimiter);
 
 const writeLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: process.env.NODE_ENV === 'test' ? 1000 : 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many write requests, please try again later' },
@@ -303,7 +313,9 @@ v1.get('/rwa/export', adminAuth, (req, res) => {
  */
 v1.get('/rwa', (req, res) => {
   const data = loadData();
-  let assets = Object.entries(data).map(([contractId, meta]) => ({ contractId, ...meta }));
+  let assets = Object.entries(data)
+    .filter(([, meta]) => isApproved(meta))
+    .map(([contractId, meta]) => ({ contractId, ...meta }));
 
   // Filter: assetType (case-insensitive)
   const { assetType, search, page, limit } = req.query;
@@ -336,6 +348,39 @@ v1.get('/rwa', (req, res) => {
 
   // Cache the full asset list (fire-and-forget)
   cacheSet('rwa:all', { data: assets, pagination: { total, page: pageNum, limit: pageSize, totalPages } }).catch(() => {});
+});
+
+/**
+ * @openapi
+ * /api/v1/rwa/pending:
+ *   get:
+ *     tags: [Assets]
+ *     summary: List all pending assets (admin only)
+ *     description: Returns all assets with status "pending" that require admin review.
+ *     security:
+ *       - ApiKeyAuth: []
+ *     responses:
+ *       200:
+ *         description: List of pending assets
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 $ref: '#/components/schemas/Asset'
+ *       401:
+ *         description: Unauthorized
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+v1.get('/rwa/pending', adminAuth, (req, res) => {
+  const data = loadData();
+  const pending = Object.entries(data)
+    .filter(([, meta]) => meta.status === ASSET_STATUS.PENDING)
+    .map(([contractId, meta]) => ({ contractId, ...meta }));
+  res.json(pending);
 });
 
 /**
@@ -374,6 +419,7 @@ v1.get('/rwa/:contractId', async (req, res) => {
   const data = loadData();
   const asset = data[contractId];
   if (!asset) return res.status(404).json({ error: 'Asset metadata not found' });
+  if (!isApproved(asset)) return res.status(404).json({ error: 'Asset metadata not found' });
 
   const result = { contractId, ...asset };
   // Cache individual asset (fire-and-forget)
@@ -427,6 +473,7 @@ v1.post('/rwa', adminAuth, writeLimiter, async (req, res) => {
   if (validationError) return res.status(400).json({ error: validationError });
 
   const data = loadData();
+  const now = new Date().toISOString();
   data[contractId] = {
     id: metadata.id || contractId,
     title: metadata.title,
@@ -436,8 +483,10 @@ v1.post('/rwa', adminAuth, writeLimiter, async (req, res) => {
     imageUrl: metadata.imageUrl || '',
     totalValuation: metadata.totalValuation || '',
     documents: Array.isArray(metadata.documents) ? metadata.documents : [],
-    createdAt: metadata.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    status: ASSET_STATUS.PENDING,
+    submittedAt: now,
+    createdAt: metadata.createdAt || now,
+    updatedAt: now,
   };
   saveData(data);
 
@@ -596,6 +645,86 @@ v1.patch('/rwa/:contractId', adminAuth, writeLimiter, async (req, res) => {
   cacheDel('rwa:all', cacheKey(contractId)).catch(() => {});
 
   req.log?.info({ contractId, fields: Object.keys(patch) }, 'Asset partially updated');
+  res.json({ contractId, ...data[contractId] });
+});
+
+/**
+ * @openapi
+ * /api/v1/rwa/{contractId}/approve:
+ *   post:
+ *     tags: [Assets]
+ *     summary: Approve a pending asset
+ *     description: Sets asset status to "approved". Requires admin API key.
+ *     security:
+ *       - ApiKeyAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: contractId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Soroban contract ID
+ *     responses:
+ *       200:
+ *         description: Asset approved
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Asset not found
+ */
+v1.post('/rwa/:contractId/approve', adminAuth, writeLimiter, async (req, res) => {
+  const { contractId } = req.params;
+  const data = loadData();
+  if (!data[contractId]) return res.status(404).json({ error: 'Asset metadata not found' });
+
+  data[contractId].status = ASSET_STATUS.APPROVED;
+  data[contractId].reviewedAt = new Date().toISOString();
+  data[contractId].reviewedBy = req.headers['x-reviewer'] || 'admin';
+  data[contractId].updatedAt = new Date().toISOString();
+  saveData(data);
+
+  cacheDel('rwa:all', cacheKey(contractId)).catch(() => {});
+  req.log?.info({ contractId }, 'Asset approved');
+  res.json({ contractId, ...data[contractId] });
+});
+
+/**
+ * @openapi
+ * /api/v1/rwa/{contractId}/reject:
+ *   post:
+ *     tags: [Assets]
+ *     summary: Reject a pending asset
+ *     description: Sets asset status to "rejected". Requires admin API key.
+ *     security:
+ *       - ApiKeyAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: contractId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Soroban contract ID
+ *     responses:
+ *       200:
+ *         description: Asset rejected
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Asset not found
+ */
+v1.post('/rwa/:contractId/reject', adminAuth, writeLimiter, async (req, res) => {
+  const { contractId } = req.params;
+  const data = loadData();
+  if (!data[contractId]) return res.status(404).json({ error: 'Asset metadata not found' });
+
+  data[contractId].status = ASSET_STATUS.REJECTED;
+  data[contractId].reviewedAt = new Date().toISOString();
+  data[contractId].reviewedBy = req.headers['x-reviewer'] || 'admin';
+  data[contractId].updatedAt = new Date().toISOString();
+  saveData(data);
+
+  cacheDel('rwa:all', cacheKey(contractId)).catch(() => {});
+  req.log?.info({ contractId }, 'Asset rejected');
   res.json({ contractId, ...data[contractId] });
 });
 
