@@ -2523,6 +2523,39 @@ mod test {
         c.init(&te.admin, &te.token_id, &100, &1000);
         c.process_auto_buyback(&te.buyer, &10);
     }
+
+    // ── get_admin / is_initialized tests ───────────────────────────────
+
+    #[test]
+    fn test_is_initialized_false_before_init() {
+        let te = setup();
+        let c = client(&te);
+        assert!(!c.is_initialized());
+    }
+
+    #[test]
+    fn test_is_initialized_true_after_init() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        assert!(c.is_initialized());
+    }
+
+    #[test]
+    fn test_get_admin_returns_correct_address() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        assert_eq!(c.get_admin(), te.admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract not initialized: admin")]
+    fn test_get_admin_panics_before_init() {
+        let te = setup();
+        let c = client(&te);
+        c.get_admin();
+    }
 }
 // --- TIMELOCK MODULE ---
 // Appended as a completely isolated module to avoid breaking existing enums.
@@ -2832,6 +2865,19 @@ pub struct EventContractUpgraded {
 
 #[contractimpl]
 impl RwaMarketplace {
+
+    /// Return the admin address. Panics if the contract is not initialized.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized: admin")
+    }
+
+    /// Return whether the contract has been initialized.
+    pub fn is_initialized(env: Env) -> bool {
+        env.storage().instance().has(&DataKey::Admin)
+    }
 
     /// Upgrade the smart contract to a new version.
     /// Only the admin can call this function.
