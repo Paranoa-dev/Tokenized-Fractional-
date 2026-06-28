@@ -15,6 +15,7 @@ import BuyShares from './components/BuyShares/BuyShares';
 import ToastContainer from './components/Toast/Toast';
 import ConfirmPurchase from './components/ConfirmPurchase/ConfirmPurchase';
 import LanguageSwitcher from './components/LanguageSwitcher/LanguageSwitcher';
+import TransactionHistory from './components/TransactionHistory/TransactionHistory';
 import styles from './App.module.css';
 
 import { useWalletStore } from './store/useWalletStore';
