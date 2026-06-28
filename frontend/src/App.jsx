@@ -190,6 +190,37 @@ function App() {
   const { data: priceData } = useSorobanRead('get_price', [], { skip: CONTRACT_ID.length < 50 });
   const pricePerShare = priceData?.retval ? Number(priceData.retval.u64()) : null;
 
+  const [acceptedTokens, setAcceptedTokens] = useState([]);
+  const [paymentToken, setPaymentToken] = useState('');
+
+  useEffect(() => {
+    if (!publicKey || CONTRACT_ID.length < 50) return;
+    (async () => {
+      try {
+        const { rpc, Contract, TransactionBuilder, Address } = await import('@stellar/stellar-sdk');
+        const server = new rpc.Server(import.meta.env.VITE_RPC_URL || 'https://soroban-testnet.stellar.org:443');
+        const contract = new Contract(CONTRACT_ID);
+        const account = await server.getAccount(publicKey);
+        const tx = new TransactionBuilder(account, {
+          fee: '100',
+          networkPassphrase: NETWORK_PASSPHRASE,
+        })
+          .addOperation(contract.call('get_accepted_tokens'))
+          .setTimeout(30)
+          .build();
+        const sim = await server.simulateTransaction(tx);
+        if (sim.result?.retval) {
+          const vec = sim.result.retval.vec();
+          const list = vec ? vec.map((v) => Address.fromScVal(v).toString()) : [];
+          setAcceptedTokens(list);
+          if (list.length > 0) setPaymentToken(list[0]);
+        }
+      } catch {
+        // silently fall back — buyer will use default
+      }
+    })();
+  }, [publicKey]);
+
   useEffect(() => {
     if (publicKey) fetchMetadata(CONTRACT_ID, API_URL);
   }, [publicKey]);
@@ -211,7 +242,8 @@ function App() {
     try {
       const scValBuyer = nativeToScVal(publicKey, { type: 'address' });
       const scValShares = nativeToScVal(buyAmount, { type: 'u32' });
-      const submitRes = await buySharesTx.execute([scValBuyer, scValShares]);
+      const scValToken = nativeToScVal(paymentToken, { type: 'address' });
+      const submitRes = await buySharesTx.execute([scValBuyer, scValShares, scValToken]);
       setConfirmPending(false);
       const hash = submitRes.hash;
       setLastTxHash(hash);
@@ -371,41 +403,15 @@ function App() {
 
       {/* ── Holdings + Buy Card ─────────────────────────────────────────── */}
       {publicKey && (
-        <Card>
-          <div className={styles.holdingsRow}>
-            <span className={styles.holdingsLabel}>{t('marketplace.shareBalance')}</span>
-            {loadingShares ? (
-              <span className={styles.holdingsValueLoading}>
-                <Spinner size="sm" label="Fetching share balance…" />
-                <Skeleton variant="text" width="3rem" height="1.6em" />
-              </span>
-            ) : (
-              <span className={styles.holdingsValue}>{shares}</span>
-            )}
-          </div>
-          <hr className={styles.divider} />
-          <h3 className={styles.purchaseHeader}>{t('marketplace.buyShares')}</h3>
-          <div className={styles.purchaseRow}>
-            <Input
-              id="buy-amount-input"
-              type="number"
-              value={buyAmount}
-              onChange={(e) => setBuyAmount(Math.max(1, Number(e.target.value)))}
-              min="1"
-              disabled={loadingBuy}
-              className={styles.buyInput}
-            />
-            <Button onClick={handleBuyShares} loading={loadingBuy} variant="primary">
-              {loadingBuy ? t('marketplace.processing') : t('marketplace.buyButton')}
-            </Button>
-          </div>
-          {loadingBuy && (
-            <div className={styles.buyLoadingHint}>
-              <Spinner size="sm" label="Processing transaction…" />
-              <span>Submitting transaction to the network…</span>
-            </div>
-          )}
-        </Card>
+        <BuyShares
+          shares={shares}
+          loadingShares={loadingShares}
+          loadingBuy={loadingBuy}
+          onBuy={handleBuyShares}
+          acceptedTokens={acceptedTokens}
+          paymentToken={paymentToken}
+          onTokenChange={setPaymentToken}
+        />
       )}
         </>
       )}
